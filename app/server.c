@@ -8,10 +8,18 @@
 #include <unistd.h>
 
 typedef struct http_status {
-	float version;
+	unsigned int version_major;
+	unsigned int version_minor;
 	int code;
 	char* reason;
 } http_status;
+
+typedef struct http_request_header {
+	char method[32];
+	char target[256];
+	unsigned int version_major;
+	unsigned int version_minor;
+} http_request_header;
 
 int main() {
 	// Disable output buffering
@@ -54,22 +62,52 @@ int main() {
 	}
 
 	printf("Waiting for a client to connect...\n");
-	client_addr_len = sizeof(client_addr);
 
+	client_addr_len = sizeof(client_addr);
 	int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
 	printf("Client connected\n");
 
+	char request[256];
+	int bytes_read;
+	if ( (bytes_read = recv(client_fd, request, 256, 0)) < 0) {
+		printf("Recv failed: %s \n", strerror(bytes_read));
+		return 1;
+	}
+	
+	http_request_header r_header;
+	printf("Parsing request header...\n");
+	if ( sscanf(request, "%s %s HTTP/%u.%u\r\n", r_header.method, r_header.target, &r_header.version_major, &r_header.version_minor) != 4) {
+		printf("Invalid request header\n");
+		return 1;
+	}
+
+	if (strcmp(r_header.method, "GET") != 0) {
+		printf("Unsupported request method. Supported: GET\n");
+		return 1;
+	}
+
+	if (r_header.version_major != 1 || r_header.version_minor != 1) {
+		// Status code 505
+		printf("Unsupported HTTP version %u.%u. Requires 1.1\n", r_header.version_major, r_header.version_minor);
+		return 1;
+	}
+
+	printf("Sending response...\n");
 	http_status status = {
-		.version = 1.1,
-		.code = 200,
-		.reason = "OK"
+		.version_major = 1,
+		.version_minor = 1,
 	};
+	if (strcmp(r_header.target, "/") == 0) {
+		status.code = 200;
+		status.reason = "OK";
+	} else {
+		status.code = 404;
+		status.reason = "Not Found";
+	}
+
 	char response[256];
-	sprintf(response, "HTTP/%.1f %u %s\r\n\r\n", status.version, status.code, status.reason);
-
+	sprintf(response, "HTTP/%u.%u %u %s\r\n\r\n", status.version_major, status.version_minor, status.code, status.reason);
 	send(client_fd, response, strlen(response), 0);
-
-	printf("Status response sent");
 
 	close(server_fd);
 
