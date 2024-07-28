@@ -8,6 +8,11 @@
 #include <errno.h>
 #include <unistd.h>
 
+typedef struct key_val {
+	char* key;
+	char* val;
+} key_val;
+
 typedef struct http_status {
 	unsigned int version_major;
 	unsigned int version_minor;
@@ -22,12 +27,19 @@ typedef struct http_response {
 	char* body;
 } http_response;
 
-typedef struct http_request_header {
+typedef struct http_request {
 	char method[32];
 	char target[256];
 	unsigned int version_major;
 	unsigned int version_minor;
-} http_request_header;
+
+	key_val * headers;
+	int headers_size;
+	int num_headers;
+
+	char* body;
+} http_request;
+
 
 int main() {
 	// Disable output buffering
@@ -75,18 +87,18 @@ int main() {
 	int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
 	printf("Client connected\n");
 
-	char request[256];
+	char request_buf[256];
 	int bytes_read;
-	if ( (bytes_read = recv(client_fd, request, 256, 0)) < 0) {
+	if ( (bytes_read = recv(client_fd, request_buf, 256, 0)) < 0) {
 		printf("Recv failed: %s \n", strerror(bytes_read));
 		return 1;
 	}
 
 	int lines_size = 8;
 	char** lines = malloc(sizeof(char*) * lines_size);
-	lines[0] = request;
+	lines[0] = request_buf;
 	int line_count = 1;
-	for (char* c = request; c != (request+bytes_read); c++) {
+	for (char* c = request_buf; c != (request_buf+bytes_read); c++) {
 		if (c[0] == '\r' && c[1] == '\n') {
 			if (line_count == lines_size) {
 				lines_size *=2;
@@ -98,25 +110,28 @@ int main() {
 		}
 	}
 	
-	http_request_header r_header;
+	http_request request = {0};
 	printf("Parsing request header...\n");
-	if ( sscanf(lines[0], "%s %s HTTP/%u.%u\r\n", r_header.method, r_header.target, &r_header.version_major, &r_header.version_minor) != 4) {
+	if ( sscanf(lines[0], "%s %s HTTP/%u.%u\r\n", request.method, request.target, &request.version_major, &request.version_minor) != 4) {
 		printf("Invalid request header\n");
 		return 1;
 	}
 
-	if (strcmp(r_header.method, "GET") != 0) {
+	if (strcmp(request.method, "GET") != 0) {
 		printf("Unsupported request method. Supported: GET\n");
 		return 1;
 	}
 
-	if (r_header.version_major != 1 || r_header.version_minor != 1) {
+	if (request.version_major != 1 || request.version_minor != 1) {
 		// Status code 505
-		printf("Unsupported HTTP version %u.%u. Requires 1.1\n", r_header.version_major, r_header.version_minor);
+		printf("Unsupported HTTP version %u.%u. Requires 1.1\n", request.version_major, request.version_minor);
 		return 1;
 	}
 
 	// NOTE: lines[line_count-1] should be the request body
+	
+	request.headers_size = 8;
+	request.headers = malloc(sizeof(key_val)*request.headers_size);
 	for (int i = 1; i < line_count-1; i++) {
 		char* left = lines[i]; 
 		char* right = 0;	
@@ -134,6 +149,15 @@ int main() {
 		}
 		
 		if (left && right) {
+			if (request.num_headers == request.headers_size) {
+				request.headers_size *= 2;
+				request.headers = realloc(request.headers, request.headers_size);
+			}
+			request.headers[request.num_headers-1] = (key_val) {
+				.key = left,
+				.val = right
+			};
+			request.num_headers++;
 			// process header key value pair left: right
 		}
 	}
@@ -146,24 +170,36 @@ int main() {
 	};
 
 	// Handle ehdpoints or 404
-	if (strcmp("/", r_header.target) == 0) {
+	if (strcmp("/", request.target) == 0) {
 		response.status.code = 200;
 		response.status.reason = "OK";
-	} else if (strncmp("/echo/", r_header.target, strlen("/echo/")) == 0) {
+	} else if (strncmp("/echo", request.target, strlen("/echo")) == 0) {
 		response.status.code = 200;
 		response.status.reason = "OK";
 
-		response.body = r_header.target+strlen("/echo/");
+		response.body = request.target+strlen("/echo/");
+	} else if (strcmp("/user-agent", request.target) == 0) {
+		response.status.code = 200;
+		response.status.reason = "OK";
 
+		for (int i = 0; i < request.num_headers; i++) {
+			if (strncmp("User-Agent", request.headers[i].key, strlen("User-Agent")) == 0) {
+				response.body = request.headers[i].val;
+				break;
+			}
+		}
+	} else {
+		response.status.code = 404;
+		response.status.reason = "Not Found";
+	}
+
+	if (response.body) {
 		response.num_headers = response.headers_size = 2;
 		response.headers = malloc(sizeof(char*) * response.headers_size);
 		response.headers[0] = "Content-Type: text/plain\r\n";
 		char content_length[128];
 		sprintf(content_length, "Content-Length: %lu\r\n", strlen(response.body));
 		response.headers[1] = content_length;
-	} else {
-		response.status.code = 404;
-		response.status.reason = "Not Found";
 	}
 
 	// Print status line
