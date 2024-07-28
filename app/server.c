@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -13,6 +14,13 @@ typedef struct http_status {
 	int code;
 	char* reason;
 } http_status;
+
+typedef struct http_response {
+	http_status status;
+	char** headers;
+	int headers_size, num_headers;
+	char* body;
+} http_response;
 
 typedef struct http_request_header {
 	char method[32];
@@ -73,10 +81,26 @@ int main() {
 		printf("Recv failed: %s \n", strerror(bytes_read));
 		return 1;
 	}
+
+	int lines_size = 8;
+	char** lines = malloc(sizeof(char*) * lines_size);
+	lines[0] = request;
+	int line_count = 1;
+	for (char* c = request; c != (request+bytes_read); c++) {
+		if (c[0] == '\r' && c[1] == '\n') {
+			if (line_count == lines_size) {
+				lines_size *=2;
+				lines = realloc(lines, sizeof(char*) * lines_size);
+			}
+			*c = '\0';
+			lines[line_count] = (c+2);
+			line_count++;
+		}
+	}
 	
 	http_request_header r_header;
 	printf("Parsing request header...\n");
-	if ( sscanf(request, "%s %s HTTP/%u.%u\r\n", r_header.method, r_header.target, &r_header.version_major, &r_header.version_minor) != 4) {
+	if ( sscanf(lines[0], "%s %s HTTP/%u.%u\r\n", r_header.method, r_header.target, &r_header.version_major, &r_header.version_minor) != 4) {
 		printf("Invalid request header\n");
 		return 1;
 	}
@@ -92,22 +116,85 @@ int main() {
 		return 1;
 	}
 
-	printf("Sending response...\n");
-	http_status status = {
-		.version_major = 1,
-		.version_minor = 1,
-	};
-	if (strcmp(r_header.target, "/") == 0) {
-		status.code = 200;
-		status.reason = "OK";
-	} else {
-		status.code = 404;
-		status.reason = "Not Found";
+	// NOTE: lines[line_count-1] should be the request body
+	for (int i = 1; i < line_count-1; i++) {
+		char* left = lines[i]; 
+		char* right = 0;	
+		char c = 0;
+		while (left[c] != '\0') {
+			if (left[c] == ':') {
+				while(isspace(left[++c]));
+
+				left[c-1] = '\0';
+				right = (left+c);
+
+				break;
+			}
+			c++;
+		}
+		
+		if (left && right) {
+			// process header key value pair left: right
+		}
 	}
 
-	char response[256];
-	sprintf(response, "HTTP/%u.%u %u %s\r\n\r\n", status.version_major, status.version_minor, status.code, status.reason);
-	send(client_fd, response, strlen(response), 0);
+	http_response response = {
+		.status = {
+			.version_major = 1,
+			.version_minor = 1,
+		},
+	};
+
+	// Handle ehdpoints or 404
+	if (strcmp("/", r_header.target) == 0) {
+		response.status.code = 200;
+		response.status.reason = "OK";
+	} else if (strncmp("/echo/", r_header.target, strlen("/echo/")) == 0) {
+		response.status.code = 200;
+		response.status.reason = "OK";
+
+		response.body = r_header.target+strlen("/echo/");
+
+		response.num_headers = response.headers_size = 2;
+		response.headers = malloc(sizeof(char*) * response.headers_size);
+		response.headers[0] = "Content-Type: text/plain\r\n";
+		char content_length[128];
+		sprintf(content_length, "Content-Length: %lu\r\n", strlen(response.body));
+		response.headers[1] = content_length;
+	} else {
+		response.status.code = 404;
+		response.status.reason = "Not Found";
+	}
+
+	// Print status line
+	int r_len = 512;
+	int r_used = 0;
+	char response_str[r_len];
+	r_used = sprintf(
+		response_str, "HTTP/%u.%u %u %s\r\n",
+		response.status.version_major,
+		response.status.version_minor,
+		response.status.code,
+		response.status.reason
+	);
+
+	//Print headers
+	for(int i = 0; i < response.num_headers; i++) {
+		strncat(response_str, response.headers[i], r_len-r_used);
+		r_used = strlen(response_str);
+	}
+	strncat(response_str, "\r\n", r_len-r_used);
+	r_used = strlen(response_str);
+	
+	// Print body
+	if (response.body) {
+		strncat(response_str, response.body, r_len-r_used);
+		r_used = strlen(response_str);
+		printf("%s\n", response_str);
+	}
+
+	printf("Sending response...\n");
+	send(client_fd, response_str, strlen(response_str), 0);
 
 	close(server_fd);
 
