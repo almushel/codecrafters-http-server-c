@@ -54,7 +54,8 @@ void* process_request(void* cfd) {
 
 	int lines_size = 8;
 	int line_count = 1;
-	char* lines[lines_size];
+	char** lines = malloc(sizeof(char*) * lines_size);
+	//char* lines[lines_size];
 	lines[0] = request_buf;
 	for (char* c = request_buf; c != (request_buf+bytes_read); c++) {
 		if (c[0] == '\r' && c[1] == '\n') {
@@ -195,6 +196,8 @@ void* process_request(void* cfd) {
 	send(client_fd, response_str, strlen(response_str), 0);
 	close(client_fd);
 
+	free(lines);
+
 	return (void*)0;
 }
 
@@ -252,6 +255,7 @@ int main() {
 		
 		pthread_t thread;
 		pthread_create(&thread, 0, process_request, (void*)(long)client_fd);
+		pthread_detach(thread);
 	}
 
 	close(server_fd);
