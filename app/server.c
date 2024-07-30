@@ -1,7 +1,9 @@
+#include <stdio.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <string.h>
@@ -25,7 +27,9 @@ typedef struct http_response {
 	http_status status;
 	char** headers;
 	int headers_size, num_headers;
+
 	char* body;
+	size_t body_size;
 } http_response;
 
 typedef struct http_request {
@@ -41,8 +45,86 @@ typedef struct http_request {
 	char* body;
 } http_request;
 
+static char* serve_dir = 0;
 
-void* process_request(void* cfd) {
+int is_dir(const char* path) {
+	if (path == 0 || path[0] == '\0') {
+		return 0;
+	}
+
+	struct stat buf;
+	stat(path, &buf);
+
+	return S_ISDIR(buf.st_mode);
+}
+
+
+int handle_echo_request(http_request* request, http_response* response) {
+	response->body = request->target+strlen("/echo/");
+	response->body_size = strlen(response->body);
+
+	return 1;
+}
+
+int handle_file_request(http_request* request, http_response* response) {
+	char* result = 0;
+	size_t result_size = 0;
+	size_t result_used = 0;
+
+	if (serve_dir == 0) {
+		return 0;
+	} else {
+		char path_buf[FILENAME_MAX+1] = {0};
+		strncpy(path_buf, serve_dir, FILENAME_MAX);
+		int last = strlen(path_buf)-1;
+		if (path_buf[last] != '/') {
+			path_buf[last+1] = '/';
+			path_buf[last+2] = '\0';
+		}
+		strncat(path_buf, request->target+sizeof("/files/")-1, FILENAME_MAX-last+1);
+
+		FILE* target_file = fopen(path_buf, "r");
+		if (target_file == NULL) {
+			return 0;
+		} else {
+			result_size = 1024;
+			result = malloc(result_size);
+			
+			char read_buf[1024];
+			size_t bytes_read;
+			while ( (bytes_read = fread(read_buf, 1, 1024, target_file)) ) {
+				if (result_used+bytes_read > result_size) {
+					result_size *= 2;
+					result = realloc(result, result_size);
+				}
+				strncpy(result+result_used, read_buf, result_size-result_used);
+				result_used += bytes_read;
+			}
+
+			fclose(target_file);
+		}
+	}
+
+	response->body = result;
+	response->body_size = result_used;
+	return 1;
+}
+
+int handle_user_agent_request(http_request* request, http_response* response) {
+	for (int i = 0; i < request->num_headers; i++) {
+		if (strncmp("User-Agent", request->headers[i].key, strlen("User-Agent")) == 0) {
+			response->body = request->headers[i].val;
+			break;
+		}
+	}
+	if (response->body) {
+		response->body_size = strlen(response->body);
+	}
+
+	return 1;
+}
+
+void* handle_connection(void* cfd) {
 	int client_fd = (int)(long)cfd;
 
 	char request_buf[256];
@@ -55,13 +137,12 @@ void* process_request(void* cfd) {
 	int lines_size = 8;
 	int line_count = 1;
 	char** lines = malloc(sizeof(char*) * lines_size);
-	//char* lines[lines_size];
 	lines[0] = request_buf;
 	for (char* c = request_buf; c != (request_buf+bytes_read); c++) {
 		if (c[0] == '\r' && c[1] == '\n') {
 			if (line_count == lines_size) {
-				printf("Max request lines reached: %i\n", lines_size);
-				break;
+				lines_size *= 2;
+				lines = realloc(lines, lines_size); 
 			}
 
 			*c = '\0';
@@ -71,14 +152,14 @@ void* process_request(void* cfd) {
 	}
 	
 	http_request request = {0};
-	printf("Parsing request header...\n");
+	puts("Parsing request header...");
 	if ( sscanf(lines[0], "%s %s HTTP/%u.%u\r\n", request.method, request.target, &request.version_major, &request.version_minor) != 4) {
-		printf("Invalid request header\n");
+		puts("Invalid request header");
 		return (void*)1;
 	}
 
 	if (strcmp(request.method, "GET") != 0) {
-		printf("Unsupported request method. Supported: GET\n");
+		puts("Unsupported request method. Supported: GET");
 		return (void*)1;
 	}
 
@@ -90,8 +171,7 @@ void* process_request(void* cfd) {
 
 	// NOTE: lines[line_count-1] should be the request body
 	request.headers_size = 8;
-	key_val request_headers[8];
-	request.headers = request_headers;
+	request.headers = malloc(sizeof(key_val) * request.headers_size);
 	for (int i = 1; i < line_count-1; i++) {
 		char* left = lines[i]; 
 		char* right = 0;	
@@ -110,10 +190,10 @@ void* process_request(void* cfd) {
 		
 		if (left && right) {
 			if (request.num_headers == request.headers_size) {
-				printf("Max request headers reached: %i", request.headers_size);
-				break;
+				request.headers_size *= 2;
+				request.headers = realloc(request.headers, request.headers_size);
 			}
-			request.headers[request.num_headers-1] = (key_val) {
+			request.headers[request.num_headers] = (key_val) {
 				.key = left,
 				.val = right
 			};
@@ -122,47 +202,61 @@ void* process_request(void* cfd) {
 		}
 	}
 
+	puts("Constructing response...");
 	http_response response = {
 		.status = {
 			.version_major = 1,
 			.version_minor = 1,
 		},
+		.headers_size = 8,
 	};
+	response.headers = malloc(sizeof(char*) * response.headers_size);
 
-	// Handle ehdpoints or 404
+	// Handle endpoints or 404
+	enum { NONE, STATUS, ECHO, FILE, USER_AGENT } response_type = NONE;
 	if (strcmp("/", request.target) == 0) {
-		response.status.code = 200;
-		response.status.reason = "OK";
-	} else if (strncmp("/echo", request.target, strlen("/echo")) == 0) {
-		response.status.code = 200;
-		response.status.reason = "OK";
-
-		response.body = request.target+strlen("/echo/");
-	} else if (strcmp("/user-agent", request.target) == 0) {
-		response.status.code = 200;
-		response.status.reason = "OK";
-
-		for (int i = 0; i < request.num_headers; i++) {
-			if (strncmp("User-Agent", request.headers[i].key, strlen("User-Agent")) == 0) {
-				response.body = request.headers[i].val;
-				break;
-			}
+		response_type = STATUS;
+	} else if (strncmp("/echo", request.target, sizeof("/echo")-1) == 0) {
+		if (handle_echo_request(&request, &response)) {
+			response_type = ECHO;
 		}
+	} else if (strncmp("/files", request.target, sizeof("/files")-1) == 0) {
+		if (handle_file_request(&request, &response)) {
+			response_type = FILE;
+		}
+	} else if (strcmp("/user-agent", request.target) == 0) {
+		if (handle_user_agent_request(&request, &response)) {
+			response_type = USER_AGENT;
+		}
+	} 
+
+	if (response_type != NONE) {
+		response.status.code = 200;
+		response.status.reason = "OK";
 	} else {
 		response.status.code = 404;
 		response.status.reason = "Not Found";
 	}
 
-	response.headers_size = 2;
-	char* response_headers[response.headers_size];
-	if (response.body) {
-		response.num_headers = response.headers_size;
-		response.headers = response_headers;
-		response.headers[0] = "Content-Type: text/plain\r\n";
+	char content_length[128];
+	switch(response_type) {
+		case ECHO:
+		case USER_AGENT: {
+			response.num_headers = 2;
+			response.headers[0] = "Content-Type: text/plain\r\n";
 
-		char content_length[128];
-		sprintf(content_length, "Content-Length: %lu\r\n", strlen(response.body));
-		response.headers[1] = content_length;
+			sprintf(content_length, "Content-Length: %lu\r\n", response.body_size);
+			response.headers[1] = content_length;
+		} break;
+		case FILE: {
+			response.num_headers = 2;
+			response.headers[0] = "Content-Type: application/octet-stream\r\n";
+
+			sprintf(content_length, "Content-Length: %lu\r\n", response.body_size);
+			response.headers[1] = content_length;
+		} break;
+
+		default: break;
 	}
 
 	// Print status line
@@ -189,22 +283,33 @@ void* process_request(void* cfd) {
 	if (response.body) {
 		strncat(response_str, response.body, r_len-r_used);
 		r_used = strlen(response_str);
-		printf("%s\n", response_str);
 	}
 
-	printf("Sending response...\n");
+	puts("Sending response...");
 	send(client_fd, response_str, strlen(response_str), 0);
 	close(client_fd);
+	puts("Response sent");
 
 	free(lines);
+	free(request.headers);
+	if (response_type == FILE) free(response.body);
+	free(response.headers);
 
 	return (void*)0;
 }
 
-int main() {
+int main(int argc, char * argv[]) {
 	// Disable output buffering
 	setbuf(stdout, NULL);
 	setbuf(stderr, NULL);
+
+	for (int i = 1; i < argc; i++) {
+		if (strncmp("--directory", argv[i], sizeof("--directory")-1) == 0) {
+			if (argc > i+1 && is_dir(argv[i+1])) {
+				serve_dir = argv[i+1];
+			}
+		}
+	}
 
 	int server_fd;
 	socklen_t client_addr_len;
@@ -236,12 +341,8 @@ int main() {
 	}
 
 	int connection_backlog = 5;
-	int max_threads = 8;
-	int num_threads = 0;
-	pthread_t threads[max_threads];
-
 	while(1) {
-		printf("Waiting for a client to connect...\n");
+		puts("Waiting for a client to connect...");
 		if (listen(server_fd, connection_backlog) != 0) {
 			printf("Listen failed: %s \n", strerror(errno));
 			return 1;
@@ -251,10 +352,10 @@ int main() {
 		int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
 		if (client_fd == -1) continue;
 
-		printf("Client connected\n");
+		puts("Client connected");
 		
 		pthread_t thread;
-		pthread_create(&thread, 0, process_request, (void*)(long)client_fd);
+		pthread_create(&thread, 0, handle_connection, (void*)(long)client_fd);
 		pthread_detach(thread);
 	}
 
