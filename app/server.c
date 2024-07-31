@@ -11,10 +11,19 @@
 #include <unistd.h>
 #include <pthread.h>
 
-typedef struct key_val {
+
+typedef struct str_node str_node;
+struct str_node {
 	char* key;
 	char* val;
-} key_val;
+
+	str_node* next;
+};
+
+typedef struct str_map {
+	str_node* data;
+	size_t size;
+} str_map;
 
 typedef struct http_status {
 	unsigned int version_major;
@@ -25,8 +34,7 @@ typedef struct http_status {
 
 typedef struct http_response {
 	http_status status;
-	char** headers;
-	int headers_size, num_headers;
+	str_map headers;
 
 	char* body;
 	size_t body_size;
@@ -38,14 +46,81 @@ typedef struct http_request {
 	unsigned int version_major;
 	unsigned int version_minor;
 
-	key_val * headers;
-	int headers_size;
-	int num_headers;
+	str_map headers;
 
 	char* body;
+	size_t body_size;
 } http_request;
 
 static char* serve_dir = 0;
+
+// Really bad hash function
+size_t str_hash(const char* key) {
+	size_t result = 0;
+	size_t len = strlen(key);
+
+	for (int i = 0; i < len; i++) {
+		result += key[i];
+	}
+
+	return result;
+}
+
+str_map str_map_new(size_t size) {
+	str_map result = {
+		.data = calloc(size, sizeof(str_node)),
+		.size = size
+	};
+
+	return result;
+}
+
+void str_map_free(str_map* map) {
+	for (int i = 0; i < map->size; i++) {
+		str_node* node = map->data+i;
+		while (node) {
+			node->key = realloc(node->key, 0);
+			node->key = realloc(node->key, 0);
+		}
+	}
+	free(map->data);
+	*map = (str_map){0};
+}
+
+void str_map_set(str_map* m, const char* key, const char* val) {
+	size_t index = str_hash(key) % m->size;
+	str_node* node = m->data+index;
+	while (node->key && strcmp(key, node->key) != 0) {
+		if (node->next == NULL) {
+			node->next = malloc(sizeof(str_node));
+			node = node->next;
+			*node = (str_node) {0};
+			break;
+		}
+		node = node->next;
+	}
+
+	node->key = realloc(node->key, strlen(key)+1);
+	node->val = realloc(node->val, strlen(val)+1);
+	strcpy(node->key, key);
+	strcpy(node->val, val);
+}
+
+char* str_map_get(str_map* m, const char* key) {
+	size_t index = str_hash(key) % m->size;
+	str_node* node = m->data+index;
+	while (node && node->key && strcmp(key, node->key) != 0) {
+		node = node->next;
+	}
+
+	if (node == NULL || node->key == NULL || node->val == NULL) {
+		return 0;
+	}
+
+	puts(node->key);
+	return node->val;
+
+}
 
 int is_dir(const char* path) {
 	if (path == 0 || path[0] == '\0') {
@@ -60,8 +135,12 @@ int is_dir(const char* path) {
 
 
 int handle_echo_request(http_request* request, http_response* response) {
-	response->body = request->target+strlen("/echo/");
-	response->body_size = strlen(response->body);
+	char* target = request->target+sizeof("/echo/")-1;
+	response->body_size = strlen(target);
+	response->body = malloc(request->body_size+1);
+	strcpy(response->body, target);
+
+	str_map_set(&response->headers, "Content-Type", "text/plain");
 
 	return 1;
 }
@@ -71,55 +150,113 @@ int handle_file_request(http_request* request, http_response* response) {
 	size_t result_size = 0;
 	size_t result_used = 0;
 
-	if (serve_dir == 0) {
-		return 0;
-	} else {
-		char path_buf[FILENAME_MAX+1] = {0};
+	char path_buf[FILENAME_MAX+1] = {0};
+	int last = 0;
+	if (serve_dir) {
 		strncpy(path_buf, serve_dir, FILENAME_MAX);
-		int last = strlen(path_buf)-1;
+		last = strlen(path_buf);
 		if (path_buf[last] != '/') {
 			path_buf[last+1] = '/';
 			path_buf[last+2] = '\0';
 		}
-		strncat(path_buf, request->target+sizeof("/files/")-1, FILENAME_MAX-last+1);
+	}
+	strncat(path_buf, request->target+sizeof("/files/")-1, FILENAME_MAX-last+1);
 
-		FILE* target_file = fopen(path_buf, "r");
-		if (target_file == NULL) {
-			return 0;
-		} else {
-			result_size = 1024;
-			result = malloc(result_size);
-			
-			char read_buf[1024];
-			size_t bytes_read;
-			while ( (bytes_read = fread(read_buf, 1, 1024, target_file)) ) {
-				if (result_used+bytes_read > result_size) {
-					result_size *= 2;
-					result = realloc(result, result_size);
-				}
-				strncpy(result+result_used, read_buf, result_size-result_used);
-				result_used += bytes_read;
+	FILE* target_file = fopen(path_buf, "r");
+	if (target_file == NULL) {
+		return 0;
+	} else {
+		result_size = 1024;
+		result = malloc(result_size);
+		
+		char read_buf[1024];
+		size_t bytes_read;
+		while ( (bytes_read = fread(read_buf, 1, 1024, target_file)) ) {
+			if (result_used+bytes_read > result_size) {
+				result_size *= 2;
+				result = realloc(result, result_size);
 			}
-
-			fclose(target_file);
+			strncpy(result+result_used, read_buf, result_size-result_used);
+			result_used += bytes_read;
 		}
+
+		fclose(target_file);
 	}
 
 	response->body = result;
 	response->body_size = result_used;
+
+	str_map_set(&response->headers, "Content-Type", "application/octet-stream");
+
 	return 1;
 }
 
 int handle_user_agent_request(http_request* request, http_response* response) {
-	for (int i = 0; i < request->num_headers; i++) {
-		if (strncmp("User-Agent", request->headers[i].key, strlen("User-Agent")) == 0) {
-			response->body = request->headers[i].val;
-			break;
+	char* src = str_map_get(&request->headers, "User-Agent");
+	if (src) {
+		response->body_size = strlen(src);
+		response->body = malloc(response->body_size+1);
+		strcpy(response->body, src);
+
+		str_map_set(&response->headers, "Content-Type", "text/plain");
+	}
+
+	return 1;
+}
+
+int handle_get_request(http_request* request, http_response* response) {
+	// Handle endpoints or 404
+	enum { NONE, STATUS, ECHO, FILE, USER_AGENT } response_type = NONE;
+
+	if (strcmp("/", request->target) == 0) {
+		response_type = STATUS;
+	} else if (strncmp("/echo", request->target, sizeof("/echo")-1) == 0) {
+		if (handle_echo_request(request, response)) {
+			response_type = ECHO;
 		}
+	} else if (strncmp("/files", request->target, sizeof("/files")-1) == 0) {
+		if (handle_file_request(request, response)) {
+			response_type = FILE;
+		}
+	} else if (strcmp("/user-agent", request->target) == 0) {
+		if (handle_user_agent_request(request, response)) {
+			response_type = USER_AGENT;
+		}
+	} 
+
+	if (response_type != NONE) {
+		response->status.code = 200;
+		response->status.reason = "OK";
+	} else {
+		response->status.code = 404;
+		response->status.reason = "Not Found";
 	}
-	if (response->body) {
-		response->body_size = strlen(response->body);
+
+	char content_length[128];
+	if (response->body_size) {
+		snprintf(content_length, 127, "%lu", response->body_size);
+		str_map_set(&response->headers, "Content-Length", content_length);
 	}
+
+	return 1;
+}
+
+int handle_post_request(http_request* request, http_response* response) {
+	if (strncmp("/files/", request->target, sizeof("/files/")-1) == 0) {
+		char path_buf[FILENAME_MAX+1] = {0};
+		if (serve_dir) {
+			strncpy(path_buf, serve_dir, FILENAME_MAX-strlen(serve_dir));
+		}
+		strncat(path_buf, request->target+sizeof("/files/")-1, FILENAME_MAX-strlen(path_buf));
+		FILE* fd = fopen(path_buf, "w");
+		if (fwrite(request->body, 1, request->body_size, fd) != request->body_size) {
+			// write failure	
+		}
+		fclose(fd);
+	}
+
+	response->status.code = 201;
+	response->status.reason = "Created";
 
 	return 1;
 }
@@ -158,29 +295,21 @@ void* handle_connection(void* cfd) {
 		return (void*)1;
 	}
 
-	if (strcmp(request.method, "GET") != 0) {
-		puts("Unsupported request method. Supported: GET");
-		return (void*)1;
-	}
-
 	if (request.version_major != 1 || request.version_minor != 1) {
 		// Status code 505
 		printf("Unsupported HTTP version %u.%u. Requires 1.1\n", request.version_major, request.version_minor);
 		return (void*)1;
 	}
 
-	// NOTE: lines[line_count-1] should be the request body
-	request.headers_size = 8;
-	request.headers = malloc(sizeof(key_val) * request.headers_size);
+	request.headers = str_map_new(8);
 	for (int i = 1; i < line_count-1; i++) {
 		char* left = lines[i]; 
-		char* right = 0;	
+		char* right = 0;
 		char c = 0;
 		while (left[c] != '\0') {
 			if (left[c] == ':') {
+				left[c] = '\0';
 				while(isspace(left[++c]));
-
-				left[c-1] = '\0';
 				right = (left+c);
 
 				break;
@@ -189,17 +318,16 @@ void* handle_connection(void* cfd) {
 		}
 		
 		if (left && right) {
-			if (request.num_headers == request.headers_size) {
-				request.headers_size *= 2;
-				request.headers = realloc(request.headers, request.headers_size);
-			}
-			request.headers[request.num_headers] = (key_val) {
-				.key = left,
-				.val = right
-			};
-			request.num_headers++;
-			// process header key value pair left: right
+			str_map_set(&request.headers, left, right);
 		}
+	}
+
+	puts("Processing header body...");
+	char* content_length = str_map_get(&request.headers, "Content-Length");
+	if (content_length) {
+		puts(content_length);
+		request.body_size = strtoul(content_length, 0, 10);
+		request.body = request_buf + (bytes_read-request.body_size);
 	}
 
 	puts("Constructing response...");
@@ -208,55 +336,13 @@ void* handle_connection(void* cfd) {
 			.version_major = 1,
 			.version_minor = 1,
 		},
-		.headers_size = 8,
+		.headers = str_map_new(8)
 	};
-	response.headers = malloc(sizeof(char*) * response.headers_size);
 
-	// Handle endpoints or 404
-	enum { NONE, STATUS, ECHO, FILE, USER_AGENT } response_type = NONE;
-	if (strcmp("/", request.target) == 0) {
-		response_type = STATUS;
-	} else if (strncmp("/echo", request.target, sizeof("/echo")-1) == 0) {
-		if (handle_echo_request(&request, &response)) {
-			response_type = ECHO;
-		}
-	} else if (strncmp("/files", request.target, sizeof("/files")-1) == 0) {
-		if (handle_file_request(&request, &response)) {
-			response_type = FILE;
-		}
-	} else if (strcmp("/user-agent", request.target) == 0) {
-		if (handle_user_agent_request(&request, &response)) {
-			response_type = USER_AGENT;
-		}
-	} 
-
-	if (response_type != NONE) {
-		response.status.code = 200;
-		response.status.reason = "OK";
-	} else {
-		response.status.code = 404;
-		response.status.reason = "Not Found";
-	}
-
-	char content_length[128];
-	switch(response_type) {
-		case ECHO:
-		case USER_AGENT: {
-			response.num_headers = 2;
-			response.headers[0] = "Content-Type: text/plain\r\n";
-
-			sprintf(content_length, "Content-Length: %lu\r\n", response.body_size);
-			response.headers[1] = content_length;
-		} break;
-		case FILE: {
-			response.num_headers = 2;
-			response.headers[0] = "Content-Type: application/octet-stream\r\n";
-
-			sprintf(content_length, "Content-Length: %lu\r\n", response.body_size);
-			response.headers[1] = content_length;
-		} break;
-
-		default: break;
+	if (strcmp("GET", request.method) == 0) {
+		handle_get_request(&request, &response);
+	} else if (strcmp("POST", request.method) == 0) {
+		handle_post_request(&request, &response);
 	}
 
 	// Print status line
@@ -272,9 +358,13 @@ void* handle_connection(void* cfd) {
 	);
 
 	//Print headers
-	for(int i = 0; i < response.num_headers; i++) {
-		strncat(response_str, response.headers[i], r_len-r_used);
-		r_used = strlen(response_str);
+	for(int i = 0; i < response.headers.size; i++) {
+		str_node* node = response.headers.data+i;
+		while (node && node->key != NULL && node->val != NULL) {
+			snprintf(response_str+r_used, r_len-r_used, "%s: %s\r\n", node->key, node->val);
+			r_used = strlen(response_str);
+			node = node->next;
+		}
 	}
 	strncat(response_str, "\r\n", r_len-r_used);
 	r_used = strlen(response_str);
@@ -286,14 +376,15 @@ void* handle_connection(void* cfd) {
 	}
 
 	puts("Sending response...");
+	puts(response_str);
 	send(client_fd, response_str, strlen(response_str), 0);
 	close(client_fd);
 	puts("Response sent");
 
 	free(lines);
-	free(request.headers);
-	if (response_type == FILE) free(response.body);
-	free(response.headers);
+	str_map_free(&request.headers);
+	str_map_free(&response.headers);
+	if (response.body) free(response.body);
 
 	return (void*)0;
 }
